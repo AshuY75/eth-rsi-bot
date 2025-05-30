@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 import requests
 import json
+import os
 
 # Telegram config
 TELEGRAM_TOKEN = "8081874806:AAEVgQpzGcOGUhW4Uj_8319aiNK18S-Z-7w"
@@ -24,12 +25,30 @@ def send_telegram(message):
 # Initialize exchange (Bybit)
 exchange = ccxt.bybit({
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'}  # Ensure spot market usage
+    'options': {'defaultType': 'spot'}
 })
 
+# Symbols
 symbols = ['ETH/USDT', 'BTC/USDT']
 
+# Initialize trade log
 trade_log = {symbol: [] for symbol in symbols}
+
+# File for persistent log
+TRADE_LOG_FILE = 'trade_log.json'
+
+def save_trade_log():
+    with open(TRADE_LOG_FILE, 'w') as f:
+        json.dump(trade_log, f, default=str)
+
+def load_trade_log():
+    if os.path.exists(TRADE_LOG_FILE):
+        with open(TRADE_LOG_FILE, 'r') as f:
+            raw = json.load(f)
+            for symbol in raw:
+                trade_log[symbol] = [(datetime.fromisoformat(t[0]), t[1]) for t in raw[symbol]]
+
+load_trade_log()
 
 def fetch_data(symbol):
     bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
@@ -48,7 +67,6 @@ def fetch_data(symbol):
 def analyze_and_alert(symbol):
     df = fetch_data(symbol)
     last = df.iloc[-1]
-    previous = df.iloc[-2]
 
     msg_prefix = f"[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
 
@@ -56,13 +74,15 @@ def analyze_and_alert(symbol):
         msg = msg_prefix + "🟢 Buy Signal: RSI < 30 and price below lower BB"
         send_telegram(msg)
         trade_log[symbol].append((datetime.now(), 'buy'))
+        save_trade_log()
 
     elif last['rsi'] > 70 and last['close'] > last['bb_upper']:
         msg = msg_prefix + "🔴 Sell Signal: RSI > 70 and price above upper BB"
         send_telegram(msg)
         trade_log[symbol].append((datetime.now(), 'sell'))
+        save_trade_log()
 
-    # Exit logic: opposite candle or midline cross
+    # Exit logic
     if trade_log[symbol]:
         last_trade_type = trade_log[symbol][-1][1]
         if ((last_trade_type == 'buy' and last['red_candle']) or
@@ -71,6 +91,7 @@ def analyze_and_alert(symbol):
             msg = msg_prefix + "⚠️ Exit Signal: Opposite candle or mid BB cross"
             send_telegram(msg)
             trade_log[symbol].append((datetime.now(), 'exit'))
+            save_trade_log()
 
 def report_profitability():
     now = datetime.now()
@@ -85,9 +106,16 @@ def report_profitability():
         msg += f"{symbol}: {profit_pct:.2f}% profitable exits out of {total} trades.\n"
     send_telegram(msg)
 
-# Schedule
+# Verify symbols
+markets = exchange.load_markets()
 for symbol in symbols:
-    schedule.every(1).minutes.do(analyze_and_alert, symbol=symbol)
+    status = "✅ Supported" if symbol in markets else "❌ Not Supported"
+    print(f"{symbol} {status}")
+
+# Schedule alerts
+for symbol in symbols:
+    schedule.every(30).seconds.do(analyze_and_alert, symbol=symbol)
+
 schedule.every().day.at("09:00").do(report_profitability)
 schedule.every().day.at("18:00").do(report_profitability)
 schedule.every().hour.at(":00").do(report_profitability)
