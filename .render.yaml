@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: eth-rsi-bot
+    env: python
+    buildCommand: ""
+    startCommand: bash start.sh
+    repo: https://github.com/YOUR_GITHUB_USERNAME/eth-rsi-bot

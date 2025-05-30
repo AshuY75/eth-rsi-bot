@@ -1,37 +1,42 @@
-# Full script for a trading bot using RSI + Bollinger Bands with Telegram alerts and emojis.
-
+print("🔍 Script started")
 import ccxt
 import pandas as pd
-import requests
-import schedule
-import time
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
+import schedule
+import time
 from datetime import datetime
+import requests
+import json
 
-# ========== Configuration ==========
-TELEGRAM_TOKEN = '8081874806:AAEVgQpzGcOGUhW4Uj_8319aiNK18S-Z-7w'
-CHAT_ID = '5990326636'
-SYMBOLS = ['ETH/USDT', 'BTC/USDT', 'USDT/INR']
-TIMEFRAME = '15m'
-LIMIT = 100
-HISTORY_FILE = 'trade_history.csv'
+# Telegram config
+TELEGRAM_TOKEN = "8081874806:AAEVgQpzGcOGUhW4Uj_8319aiNK18S-Z-7w"
+CHAT_ID = "5990326636"
 
-# ========== Initialize Exchange ==========
-exchange = ccxt.binance()
-
-# ========== Helper Functions ==========
-
-def send_telegram_message(message):
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message}
-    requests.post(url, data=data)
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Failed to send message: {e}")
+
+# Initialize exchange (Bybit)
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'spot'}  # Ensure spot market usage
+})
+
+symbols = ['ETH/USDT', 'BTC/USDT']
+
+trade_log = {symbol: [] for symbol in symbols}
 
 def fetch_data(symbol):
-    bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT)
+    bars = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=100)
     df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
+
     bb = BollingerBands(close=df['close'], window=20, window_dev=2)
     df['bb_upper'] = bb.bollinger_hband()
     df['bb_lower'] = bb.bollinger_lband()
@@ -40,50 +45,54 @@ def fetch_data(symbol):
     df['green_candle'] = df['close'] > df['open']
     return df
 
-def log_trade(symbol, signal_type):
-    with open(HISTORY_FILE, 'a') as f:
-        f.write(f"{datetime.now()},{symbol},{signal_type}\n")
+def analyze_and_alert(symbol):
+    df = fetch_data(symbol)
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
 
-def analyze_profitability():
-    try:
-        df = pd.read_csv(HISTORY_FILE, names=['time', 'symbol', 'signal'])
-        counts = df['signal'].value_counts()
-        total = counts.sum()
-        profitable = counts.get('BUY', 0) + counts.get('SELL', 0)
-        percentage = (profitable / total) * 100 if total > 0 else 0
-        send_telegram_message(f"📈 Profitability Report:\n✅ Profitable signals: {percentage:.2f}%\n🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    except FileNotFoundError:
-        send_telegram_message("📉 No trade history found for profitability analysis.")
+    msg_prefix = f"[{symbol}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
 
-# ========== Strategy Logic ==========
+    if last['rsi'] < 30 and last['close'] < last['bb_lower']:
+        msg = msg_prefix + "🟢 Buy Signal: RSI < 30 and price below lower BB"
+        send_telegram(msg)
+        trade_log[symbol].append((datetime.now(), 'buy'))
 
-def check_signals():
-    for symbol in SYMBOLS:
-        df = fetch_data(symbol)
-        last = df.iloc[-1]
+    elif last['rsi'] > 70 and last['close'] > last['bb_upper']:
+        msg = msg_prefix + "🔴 Sell Signal: RSI > 70 and price above upper BB"
+        send_telegram(msg)
+        trade_log[symbol].append((datetime.now(), 'sell'))
 
-        message = f"\n🔍 [{symbol}] Check @ {datetime.now().strftime('%H:%M:%S')}\nPrice: {last['close']:.2f}\nRSI: {last['rsi']:.2f}"
+    # Exit logic: opposite candle or midline cross
+    if trade_log[symbol]:
+        last_trade_type = trade_log[symbol][-1][1]
+        if ((last_trade_type == 'buy' and last['red_candle']) or
+            (last_trade_type == 'sell' and last['green_candle']) or
+            (last['close'] > last['bb_mid'] if last_trade_type == 'buy' else last['close'] < last['bb_mid'])):
+            msg = msg_prefix + "⚠️ Exit Signal: Opposite candle or mid BB cross"
+            send_telegram(msg)
+            trade_log[symbol].append((datetime.now(), 'exit'))
 
-        if last['rsi'] < 30 and last['close'] <= last['bb_lower']:
-            message += "\n🟢 BUY SIGNAL - RSI < 30 and below lower BB"
-            log_trade(symbol, 'BUY')
-        elif last['rsi'] > 70 and last['close'] >= last['bb_upper']:
-            message += "\n🔴 SELL SIGNAL - RSI > 70 and above upper BB"
-            log_trade(symbol, 'SELL')
-        elif last['red_candle'] or last['green_candle'] and (last['close'] >= last['bb_mid'] or last['close'] <= last['bb_mid']):
-            message += "\n⚠️ EXIT SIGNAL - Candle reversed or price crossed BB mid"
-            log_trade(symbol, 'EXIT')
+def report_profitability():
+    now = datetime.now()
+    msg = f"📈 Daily Profitability Report ({now.strftime('%Y-%m-%d %H:%M')})\n"
+    for symbol in symbols:
+        signals = trade_log[symbol]
+        buys = [t for t in signals if t[1] == 'buy']
+        sells = [t for t in signals if t[1] == 'sell']
+        exits = [t for t in signals if t[1] == 'exit']
+        total = len(signals)
+        profit_pct = (len(exits) / total * 100) if total else 0
+        msg += f"{symbol}: {profit_pct:.2f}% profitable exits out of {total} trades.\n"
+    send_telegram(msg)
 
-        send_telegram_message(message)
+# Schedule
+for symbol in symbols:
+    schedule.every(1).minutes.do(analyze_and_alert, symbol=symbol)
+schedule.every().day.at("09:00").do(report_profitability)
+schedule.every().day.at("18:00").do(report_profitability)
+schedule.every().hour.at(":00").do(report_profitability)
 
-# ========== Scheduling ==========
-schedule.every(1).minutes.do(check_signals)
-schedule.every().hour.do(analyze_profitability)
-schedule.every().day.at("09:00").do(analyze_profitability)
-schedule.every().day.at("18:00").do(analyze_profitability)
-
-print("✅ RSI + BB Bot with Telegram Alerts is running...")
-
+print("✅ RSI + BB Bot (Bybit) with Telegram Alerts is running...")
 while True:
     schedule.run_pending()
     time.sleep(1)
